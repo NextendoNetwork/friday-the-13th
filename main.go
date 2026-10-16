@@ -49,7 +49,8 @@ func stationScheme() string { return envOr("FRIDAY13_STATION_SCHEME", "prudps") 
 
 func secureMinor() int { return envOrInt("FRIDAY13_SECURE_MINOR", 0) }
 
-func legacyPia() bool { return envOr("FRIDAY13_LEGACY_PIA", "0") != "0" }
+// Friday uses plain NEX peer stations, not Pia 5.19 stations.
+func legacyPia() bool { return true }
 
 func main() {
 	settings := nex.NewSwitchSettings(accessKey, nexVersion)
@@ -88,10 +89,16 @@ func main() {
 	mm.UseSearchCriteria = true
 	// Plain NEX P2P stations, not the Pia shape (see stations.go).
 	mm.SessionStations = sessionStations
+	reach := newReachability()
+	mm.AutoMatchHostAllowed = reach.allowed
 	// Joining from the Friends list looks the friend's session up with FindMatchmakeSessionByParticipant.
 	mm.FindByParticipantEnabled = true
 	// Register serialization must be confirmed against the first game connection.
+	// Plain NEX P2P (not Pia): register the station shape DBFZ's working server uses.
 	scCfg := nex.SwitchPia519Config()
+	if legacyPia() {
+		scCfg = nex.LegacyPiaConfig()
+	}
 	secureEndpoint.Register(nex.ProtocolSecureConnection, nex.SecureConnectionHandlerWithConfig(scCfg))
 	secureEndpoint.Register(nex.ProtocolMatchmakeExtension, mm.ExtensionHandler())
 	secureEndpoint.Register(nex.ProtocolMatchMaking, mm.MatchMakingHandler())
@@ -106,13 +113,25 @@ func main() {
 	secureEndpoint.OnRMC = func(c *nex.Connection, req *nex.RMCMessage) {
 		logSecure(c, req)
 		noteRMC(c, req)
-		noteSelfStation(c, req)
+		noteNAT(c, req)
+		reach.observe(c, req, mm)
+		// A new room or join attempt opens a fresh UDP socket: forget the old endpoint.
+		if (req.Protocol == nex.ProtocolMatchmakeExtension && (req.Method == nex.MethodCreateMatchmakeSessionWithParam ||
+			req.Method == nex.MethodJoinMatchmakeSessionWithParam || req.Method == nex.MethodAutoMatchmakeWithParamPostpone)) ||
+			(req.Protocol == nex.ProtocolMatchMaking && req.Method == nex.MethodUnregisterGathering) ||
+			(req.Protocol == nex.ProtocolMatchMakingExt && req.Method == nex.MethodEndParticipation) {
+			peers.mu.Lock()
+			delete(peers.stations, c.ID)
+			peers.mu.Unlock()
+		}
 	}
 	secureEndpoint.OnConnect = func(c *nex.Connection) {
 		fmt.Printf("[Friday13 Secure] connected pid=%d id=%d addr=%s\n", c.PID, c.ID, c.RemoteAddr)
 	}
 	secureEndpoint.OnDisconnect = func(c *nex.Connection) {
 		mm.RemovePlayer(c.PID)
+		peers.remove(c)
+		reach.remove(c.ID)
 	}
 	secureServer := nex.NewServer(secureEndpoint)
 

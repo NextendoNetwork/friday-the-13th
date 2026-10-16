@@ -107,6 +107,9 @@ func handleBackend(w http.ResponseWriter, r *http.Request) {
 			"XPAmountToCurrentLevel": ep["ToCurrentLevel"],
 			"XPAmountToNextLevel":    ep["ToNextLevel"],
 		}
+	case "/v0/data/modifiers":
+		// Parsed at main 0x5ced20: GetNumberField("ExperienceMultiplier"); a missing field is 0x XP.
+		resp = map[string]any{"ExperienceMultiplier": 1}
 	case "/v0/news":
 		// Parsed at main 0x5308c8: TotalCount + NewsItems[{NewsItemId, UnixTime, Headline, Content}].
 		resp = newsResponse()

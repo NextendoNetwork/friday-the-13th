@@ -1,11 +1,12 @@
 package main
 
-// stations.go hands joiners the host stations Friday the 13th's NEX P2P (UNEXNetDriver, not
-// Pia) can use. The shared bridge shapes stations for Pia (type=11, Pa=<private>, natf/natm
-// from Register = 0) and guesses the UDP port from the nncs observation per public IP, which
-// picks the wrong player when two share an IP. Here the port comes from the station the host
-// reported itself in RequestProbeInitiationExt when known, and the shape follows plain NEX:
-// type=3, no Pa, the host's reported NAT mapping/filtering.
+// stations.go gives joiners the host's real UDP endpoints, the way the Dragon Ball FighterZ
+// server does (its NEX P2P, also Unreal over plain NEX stations, works between two instances on
+// one PC). Register precedes the game's UDP socket and advertises port 1; the station a player
+// sends with RequestProbeInitiationExt carries its actual endpoint plus its LAN candidate
+// (Ntrpa/Ntrpp). Learn that per authenticated connection, never per IP, and when answering
+// GetSessionURLs only refresh address/port: transport, stream, type and identity stay exactly
+// as registered.
 
 import (
 	"fmt"
@@ -21,17 +22,80 @@ import (
 const (
 	protoNATTraversal               = 0x3
 	methodRequestProbeInitiationExt = 0x3
+	methodReportNATProperties       = 0x5
 )
 
-var (
-	selfPortsMu sync.Mutex
-	selfPorts   = map[uint64]int{} // PID -> public UDP port its own NEX reported
-)
+type peerEndpoints struct {
+	mu       sync.RWMutex
+	stations map[uint32][]*nex.StationURL // connection ID -> [public, local]
+	natPorts map[uint32]int               // connection ID -> nncs port seen at its NAT check
+}
 
-const methodReportNATProperties = 0x5
+var peers = &peerEndpoints{stations: map[uint32][]*nex.StationURL{}, natPorts: map[uint32]int{}}
+
+func (p *peerEndpoints) remove(c *nex.Connection) {
+	p.mu.Lock()
+	delete(p.stations, c.ID)
+	delete(p.natPorts, c.ID)
+	p.mu.Unlock()
+}
+
+// learn records the endpoint a player advertised for itself (from DBFZ peer_endpoints.go).
+func (p *peerEndpoints) learn(c *nex.Connection, u *nex.StationURL) {
+	ip := net.ParseIP(u.Get("address"))
+	port := u.GetInt("port")
+	if ip == nil || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLoopback() || port <= 1 || port > 65535 {
+		return
+	}
+	u = u.Copy()
+	u.Remove("PRID")
+	u.Remove("probeinit")
+	u.Set("PID", strconv.FormatUint(c.PID, 10))
+	u.SetInt("RVCID", int(c.ID))
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var local, public *nex.StationURL
+	for _, old := range p.stations[c.ID] {
+		if addr := net.ParseIP(old.Get("address")); addr != nil && addr.IsPrivate() {
+			local = old
+		} else {
+			public = old
+		}
+	}
+	if ip.IsPrivate() {
+		local = u
+		local.Remove("type")
+		local.Remove("Pa")
+	} else {
+		observed, _, err := net.SplitHostPort(c.RemoteAddr)
+		if err != nil || !ip.Equal(net.ParseIP(observed)) {
+			return
+		}
+		public = u
+		lanIP := net.ParseIP(u.Get("Ntrpa"))
+		lanPort := u.GetInt("Ntrpp")
+		if lanIP != nil && lanIP.IsPrivate() && lanPort > 1 && lanPort <= 65535 {
+			local = u.Copy()
+			local.Set("address", lanIP.String())
+			local.SetInt("port", lanPort)
+			local.Remove("type")
+			local.Remove("Pa")
+		}
+	}
+	urls := make([]*nex.StationURL, 0, 2)
+	if public != nil {
+		urls = append(urls, public)
+	}
+	if local != nil {
+		urls = append(urls, local)
+	}
+	p.stations[c.ID] = urls
+	fmt.Printf("[Friday13 Stations] learned connection=%d pid=%d UDP port=%d candidates=%d\n", c.ID, c.PID, port, len(urls))
+}
 
 // natPortFromFile reads the nncs responder's current observation for ip straight from its file
-// (the library's copy is cached for 2 s, long enough to hand back the other player's port).
+// (the library's copy is cached for 2 s, long enough to hand back another player's port).
 func natPortFromFile(ip string) int {
 	data, err := os.ReadFile(envOr("NNCS_NAT_FILE", "/nat/nat_endpoints.txt"))
 	if err != nil {
@@ -39,112 +103,96 @@ func natPortFromFile(ip string) int {
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if f := strings.Fields(line); len(f) == 2 && f[0] == ip {
-			if p, err := strconv.Atoi(f[1]); err == nil && p > 0 && p < 65536 {
-				return p
+			if port, err := strconv.Atoi(f[1]); err == nil && port > 0 && port < 65536 {
+				return port
 			}
 		}
 	}
 	return 0
 }
 
-// noteSelfStation records each player's own public UDP port: from the nncs observation at the
-// moment it reports its NAT properties (its NAT check just ran, so a shared-IP entry is its
-// own), and from the station it advertises when it asks for NAT probes
-// (list<string> targets, string stationToProbe).
-func noteSelfStation(c *nex.Connection, req *nex.RMCMessage) {
+// noteNAT learns endpoints from the NAT traversal calls a player makes.
+func noteNAT(c *nex.Connection, req *nex.RMCMessage) {
 	if req.Protocol != protoNATTraversal {
 		return
 	}
-	if req.Method == methodReportNATProperties {
+	switch req.Method {
+	case methodReportNATProperties:
+		// The NAT check just ran, so a shared-IP nncs entry is this player's own.
 		if ip, _, err := net.SplitHostPort(c.RemoteAddr); err == nil {
 			if port := natPortFromFile(ip); port != 0 {
-				selfPortsMu.Lock()
-				selfPorts[c.PID] = port
-				selfPortsMu.Unlock()
-				fmt.Printf("[Friday13 Stations] pid=%d NAT check -> udp port %d\n", c.PID, port)
+				peers.mu.Lock()
+				peers.natPorts[c.ID] = port
+				peers.mu.Unlock()
+				fmt.Printf("[Friday13 Stations] connection=%d pid=%d NAT check -> udp port %d\n", c.ID, c.PID, port)
 			}
 		}
-		return
-	}
-	if req.Method != methodRequestProbeInitiationExt {
-		return
-	}
-	in := nex.NewStreamIn(req.Body, c.Settings)
-	_ = nex.ReadList(in, func(i *nex.StreamIn) string { return i.String() })
-	station := nex.ParseStationURL(in.String())
-	if in.Err() != nil || station == nil {
-		return
-	}
-	if port := station.GetInt("port"); port > 0 && port < 65536 {
-		selfPortsMu.Lock()
-		selfPorts[c.PID] = port
-		selfPortsMu.Unlock()
+	case methodRequestProbeInitiationExt:
+		in := nex.NewStreamIn(req.Body, c.Settings)
+		n := in.U32()
+		if n > 64 {
+			return
+		}
+		for i := uint32(0); i < n; i++ {
+			_ = in.String()
+		}
+		own := in.String()
+		if in.Err() == nil {
+			if u := nex.ParseStationURL(own); u != nil {
+				peers.learn(c, u)
+			}
+		}
 	}
 }
 
-func selfPort(pid uint64) int {
-	selfPortsMu.Lock()
-	defer selfPortsMu.Unlock()
-	return selfPorts[pid]
-}
-
-func isPrivateAddr(s string) bool {
-	ip := net.ParseIP(s)
-	return ip != nil && (ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast())
-}
-
-// sessionStations builds [lan, public] for host as seen by joiner.
+// sessionStations answers GetSessionURLs with the host's registered stations, refreshing only
+// address and port from what the host itself advertised (or, before it has, its NAT check).
 func sessionStations(joiner, host *nex.Connection) []*nex.StationURL {
 	raw := host.Stations()
-	var local, public *nex.StationURL
+	natMap, natFilter := host.NATProps()
+	peers.mu.RLock()
+	learned := peers.stations[host.ID]
+	natPort := peers.natPorts[host.ID]
+	peers.mu.RUnlock()
+
+	var public, local *nex.StationURL
 	for _, u := range raw {
-		if isPrivateAddr(u.Get("address")) {
-			if local == nil {
-				local = u
+		corrected := u.Copy()
+		// Register happens before NAT discovery; use the host's reported result.
+		corrected.SetInt("natm", int(natMap))
+		corrected.SetInt("natf", int(natFilter))
+		ip := net.ParseIP(u.Get("address"))
+		fixed := false
+		for _, e := range learned {
+			eip := net.ParseIP(e.Get("address"))
+			if ip == nil || eip == nil || ip.IsPrivate() != eip.IsPrivate() {
+				continue
 			}
-		} else if public == nil {
-			public = u
+			corrected.Set("address", e.Get("address"))
+			corrected.SetInt("port", e.GetInt("port"))
+			fixed = true
+			break
+		}
+		if !fixed && natPort != 0 {
+			corrected.SetInt("port", natPort)
+		}
+		if ip != nil && ip.IsPrivate() {
+			local = corrected
+		} else {
+			public = corrected
 		}
 	}
-	if local == nil || public == nil {
-		return raw
+	out := make([]*nex.StationURL, 0, 2)
+	if public != nil {
+		out = append(out, public)
 	}
-
-	port, source := selfPort(host.PID), "self-reported"
-	if port == 0 {
-		observed, ok := nex.NatPortForIP(public.Get("address"))
-		if !ok {
-			fmt.Printf("[Friday13 Stations] host=%d: no port known -> raw stations\n", host.PID)
-			return raw
-		}
-		port, source = observed, "nncs"
-		// Two players behind one IP share a single nncs entry, which then names the joiner.
-		if j := selfPort(joiner.PID); j != 0 && j == observed && joiner.PID != host.PID {
-			fmt.Printf("[Friday13 Stations] host=%d: nncs port %d is the joiner's own -> raw stations\n", host.PID, observed)
-			return raw
-		}
+	if local != nil {
+		out = append(out, local)
 	}
-
-	natMap, natFilter := host.NATBehaviour()
-	// Register's URLs carry the client↔server transport (Tpt=2, PRUDP over WebSocket); the
-	// stations NEX builds for its own peer probes use Tpt=0, the UDP transport peers speak.
-	lan := local.Copy()
-	lan.SetInt("Tpt", 0)
-	lan.SetInt("port", port)
-	lan.SetInt("natm", int(natMap))
-	lan.SetInt("natf", int(natFilter))
-	lan.Remove("type")
-	lan.Remove("Pa")
-
-	pub := public.Copy()
-	pub.SetInt("Tpt", 0)
-	pub.SetInt("port", port)
-	pub.SetInt("natm", int(natMap))
-	pub.SetInt("natf", int(natFilter))
-	pub.SetInt("type", 3)
-	pub.Remove("Pa")
-
-	fmt.Printf("[Friday13 Stations] host=%d joiner=%d port=%d (%s) natm=%d natf=%d\n",
-		host.PID, joiner.PID, port, source, natMap, natFilter)
-	return []*nex.StationURL{lan, pub}
+	source := "nat-check"
+	if len(learned) > 0 {
+		source = "advertised"
+	}
+	fmt.Printf("[Friday13 Stations] host=%d joiner=%d source=%s\n", host.PID, joiner.PID, source)
+	return out
 }
